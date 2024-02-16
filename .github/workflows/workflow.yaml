@@ -1,0 +1,100 @@
+name: "Serverless Memo App workflow file"
+on:
+  # trigger/start job when push happens to any of specified branches
+  push:
+    branches:
+      - feature/**
+      - main
+# required permissions by GitHub Actions for assuming AWS IAM role
+permissions:
+  id-token: write # This is required for requesting the JWT
+  contents: read # This is required for actions/checkout
+env:
+  AWS_REGION: "us-east-1"
+  IAM_ROLE: "arn:aws:iam::905418100201:role/GitHubActionsTerraformIAMrole"
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # default settings to apply for all the steps
+    defaults:
+      run:
+        shell: bash
+    # Steps represent a sequence of tasks that will be executed as part of the job
+    steps:
+      # equivalent of "git clone repo"
+      - uses: actions/checkout@v3
+
+      - name: configure aws credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: "${{ env.IAM_ROLE }}"
+          role-session-name: GitHubActionsRoleSession
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Run build commands
+      - name: Check out the repository to the runner
+        uses: actions/checkout@v4
+
+        # Create a bundle for lambda
+      - name: Create dist folder
+        working-directory: ./backend/
+        run: |
+          rm -rf lambda.zip
+          rm -rf node_modules
+          rm -rf dist
+          npm install @types/node
+          npm run build 
+          npm run bundle
+
+      # Initialize a new or existing Terraform working directory by creating initial files, loading any remote state, downloading modules, etc.
+
+      - name: Terraform Init
+        working-directory: ./root_module/
+        run: terraform init
+
+      # Checks that all Terraform configuration files adhere to a canonical format
+      - name: Terraform Format
+        run: terraform fmt -check
+
+      # Generates an execution plan for Terraform
+      - name: Terraform Plan
+        working-directory: ./root_module/
+        run: terraform plan -input=false
+
+      # Build infrastructure according to Terraform configuration files
+      - name: Terraform Apply
+        working-directory: ./root_module/
+        run: |
+          terraform apply -auto-approve -input=false
+
+      # add values in .env file
+      - name: adding backend ids
+        working-directory: ./root_module/
+        run: |
+          echo "VITE_BACKEND_API_URL=$(terraform output -raw http_endpoint)" > ../frontend/.env
+          echo "VITE_USER_POOL_ID=$(terraform output -raw user_pool_id)" >> ../frontend/.env
+          echo "VITE_USER_POOL_CLIENT_ID=$(terraform output -raw user_pool_client_id)" >> ../frontend/.env
+          echo "VITE_AWS_REGION=${AWS_REGION}" >> ../frontend/.env
+
+        # creates files for frontend
+      - name: Create frontend files
+        working-directory: ./frontend/
+        run: |
+          rm -rf dist
+          rm -rf node_modules
+          npm install vite typescript
+          npm run build
+
+      #copy files to s3 bucket
+      - name: Copy files to S3
+        working-directory: ./root_module/
+        run: aws s3 cp ../frontend/dist/ s3://$(terraform output -raw s3_bucket_name)/ --recursive
+
+      - name: Cloudfront invalidation
+        working-directory: ./root_module/
+        run: aws cloudfront create-invalidation --distribution-id $(terraform output -raw cloud_front_distribution_id) --paths /*
+
+      # # Destroy infrastructure according to Terraform configuration files
+      # - name: Terraform destroy
+      #   working-directory: ./root_module/
+      #   run: terraform destroy -auto-approve
